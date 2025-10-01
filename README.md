@@ -46,15 +46,12 @@ python eye_robot_demo.py --mode video --camera_index 0 --show
 
 > **Tip:** The planner defaults to float32 math. You can experiment with other tinygrad compute dtypes via `EYE_COMPUTE_DTYPE=float16` (or similar) before launching the script. Set `EYE_TINYJIT=1` to enable JIT compilation once you're comfortable with the flow.
 
-## Exploring the Notebook
-
-Launch Jupyter and open the tutorial to step through the planner interactively:
-
+You might also benefit from specifying the cache arguments, platform, and BEAM optimization level. For example:
 ```bash
-jupyter lab eye_robot_demo_tutorial.ipynb
+export XDG_CACHE_HOME=/tmp/tinygrad_cache; export CACHELEVEL=2
+METAL=1 DEFAULT_FLOAT=FLOAT32 EYE_COMPUTE_DTYPE=float32 JIT=3 BEAM=2 python3.11 eye_robot_demo.py --mode video --camera_index 0 --show
 ```
 
-Each section introduces a new concept—forward kinematics, inverse kinematics seeding, energy evaluation, refinement loop—and includes code cells you can tweak on the fly.
 
 ## Running Tests
 
