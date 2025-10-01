@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""Chunked eye robot planner with Jacobian-preconditioned energy minimization.
+
+The planning loop relies on TinyGrad for automatic differentiation and can run
+either in a text-based simulator or an OpenCV-powered video interface that maps
+image clicks to workspace goals.
+"""
+
 import argparse, math, os, random, sys, time
 from typing import List, Optional, Sequence, Tuple
 
@@ -23,6 +30,7 @@ TAU = math.tau
 
 
 def banner() -> None:
+    """Print a quick description and CLI usage examples for the demo."""
     print(
         "eye_robot_demo.py | chunked planner with Jacobian-preconditioned EBM\n"
         "Examples:\n"
@@ -34,24 +42,29 @@ def banner() -> None:
 
 
 def clamp(x: float, lo: float, hi: float) -> float:
+    """Clamp a scalar into the inclusive range [`lo`, `hi`]."""
     return lo if x < lo else hi if x > hi else x
 
 
 def wrap_angle(a: float) -> float:
+    """Wrap an angle in radians into the interval (-pi, pi]."""
     a = (a + math.pi) % TAU - math.pi
     return a + TAU if a <= -math.pi else a - TAU if a > math.pi else a
 
 
 def format_vec(vec: Sequence[float], prec: int = 3) -> str:
+    """Format a sequence of floats for pretty logging."""
     return "[" + ", ".join(f"{v:.{prec}f}" for v in vec) + "]"
 
 
 def tensor_row_to_list(t: Tensor) -> List[float]:
+    """Convert a 1D TinyGrad tensor to a Python float list in float32."""
     t_cast = t if t.dtype == dtypes.float32 else t.cast(dtypes.float32)
     return [float(x) for x in t_cast.tolist()]
 
 
 def wrap_tensor(theta: Tensor) -> Tensor:
+    """Elementwise angle wrap for tensors, keeping grads intact."""
     two_pi = TAU
     shifted = theta + math.pi
     wrapped = shifted - (shifted / two_pi).floor() * two_pi - math.pi
@@ -61,6 +74,7 @@ def wrap_tensor(theta: Tensor) -> Tensor:
 
 
 def make_energy_jit(prior, horizon: int, alpha: float, beta: float, compute_dtype):
+    """Build a TinyJit-ed energy function that matches `ChunkedPlanner.energy`."""
     @TinyJit
     def energy_jit(plan: Tensor, goal: Tensor) -> Tensor:
         plan_c = plan if plan.dtype == compute_dtype else plan.cast(compute_dtype)
@@ -77,6 +91,7 @@ def make_energy_jit(prior, horizon: int, alpha: float, beta: float, compute_dtyp
 
 
 def fk_xy(q: Tensor) -> Tensor:
+    """Planar forward kinematics that maps joint angles to `(x, y)` positions."""
     theta1 = q[..., 0]
     theta12 = theta1 + q[..., 1]
     theta123 = theta12 + q[..., 2]
@@ -86,6 +101,7 @@ def fk_xy(q: Tensor) -> Tensor:
 
 
 def jacobian_diag(q_vals: Sequence[float]) -> List[float]:
+    """Return diagonal terms of (J^T J) for scaling joint-space gradients."""
     q1, q2, q3 = q_vals
     th1, th12, th123 = q1, q1 + q2, q1 + q2 + q3
     s = math.sin
@@ -100,6 +116,7 @@ def jacobian_diag(q_vals: Sequence[float]) -> List[float]:
 
 
 def simple_ik(goal_xy: Sequence[float]) -> List[float]:
+    """Analytic IK seed that reaches a goal using a simple wrist-off strategy."""
     x, y = goal_xy
     l1, l2, l3 = LINK
     r = clamp(math.hypot(x, y), 1e-6, l1 + l2 + l3 - 1e-6)
@@ -116,6 +133,8 @@ def simple_ik(goal_xy: Sequence[float]) -> List[float]:
 
 
 class PriorMLP:
+    """Small frozen MLP that penalizes implausible joint sequences."""
+
     def __init__(self, horizon: int) -> None:
         hidden = max(16, horizon * 3)
         self.h = horizon
@@ -128,6 +147,7 @@ class PriorMLP:
                 layer.bias.requires_grad = False
 
     def __call__(self, plan: Tensor) -> Tensor:
+        """Compute the prior cost for a single plan or batch of plans."""
         if len(plan.shape) == 2:
             flat = plan.reshape((1, self.h * 3))
         else:
@@ -140,6 +160,8 @@ class PriorMLP:
 
 
 class ChunkedPlanner:
+    """Sampling-based planner that refines top trajectories with Jacobian steps."""
+
     def __init__(
         self,
         horizon: int,
@@ -153,6 +175,7 @@ class ChunkedPlanner:
         beta_ema: float = 0.9,
         noise_scale: float = 0.05,
     ) -> None:
+        """Configure planning horizon, sampling counts, and optimizer weights."""
         self.H, self.K, self.M, self.lr = horizon, candidates, refine_top, lr
         self.alpha, self.beta, self.lam = alpha, beta, lam
         self.alpha_j, self.beta_ema, self.noise = alpha_j, beta_ema, noise_scale
@@ -174,6 +197,7 @@ class ChunkedPlanner:
         self.goal_reset_thresh = float(os.environ.get("EYE_GOAL_RESET", "0.08"))
 
     def reset(self) -> None:
+        """Clear EMA history and candidate plans so planning restarts fresh."""
         for buf in self.ema:
             for row in buf:
                 for j in range(3):
@@ -183,6 +207,7 @@ class ChunkedPlanner:
         self.last_goal = None
 
     def energy(self, plan: Tensor, goal: Tensor) -> Tensor:
+        """Evaluate the scalar energy for one plan or a batch of plans."""
         if self._energy_eval is not None:
             return self._energy_eval(plan, goal)
         plan_c = plan if plan.dtype == self.compute_dtype else plan.cast(self.compute_dtype)
@@ -207,6 +232,7 @@ class ChunkedPlanner:
         return self.alpha * goal_term + self.beta * smooth + self.prior(plan_c)
 
     def _generate_plan(self, q0: Sequence[float], target: Sequence[float]) -> List[List[float]]:
+        """Interpolate from the current joint state to an IK target with noise."""
         plan_rows: List[List[float]] = []
         for t in range(self.H):
             tau = float(t + 1) / float(self.H + 1)
@@ -219,9 +245,11 @@ class ChunkedPlanner:
         return plan_rows
 
     def _generate_plans(self, q0: Sequence[float], target: Sequence[float], count: int) -> List[List[List[float]]]:
+        """Sample `count` noisy plans around the same target seed."""
         return [self._generate_plan(q0, target) for _ in range(count)]
 
     def refine(self, plan: Tensor, goal: Tensor, ema: List[List[float]]) -> Tuple[Tensor, float, float]:
+        """Run one gradient-descent refinement step on a single candidate."""
         storage_dtype = plan.dtype
         W = plan if plan.dtype == self.compute_dtype else plan.cast(self.compute_dtype)
         W.requires_grad = True
@@ -254,6 +282,7 @@ class ChunkedPlanner:
         return W_new, float(e_before.item()), float(e_after.item())
 
     def plan_once(self, q0: Sequence[float], goal_xy: Sequence[float]) -> Tuple[float, float, float, List[float]]:
+        """Run one planning tick and return diagnostics plus the next joint move."""
         target = simple_ik(goal_xy)
         reset_required = self.proposals is None
         if self.last_goal is not None and not reset_required:
@@ -339,6 +368,7 @@ class ChunkedPlanner:
         return best_before, best_after, refine_time, q_next
 
 def plan_tick(planner: ChunkedPlanner, q: List[float], goal: List[float]) -> Tuple[float, float, float, List[float], float, float, int]:
+    """Convenience wrapper that runs one planner step and logs TinyGrad counters."""
     from tinygrad.helpers import GlobalCounters
 
     GlobalCounters.reset()
@@ -352,6 +382,7 @@ def plan_tick(planner: ChunkedPlanner, q: List[float], goal: List[float]) -> Tup
 
 
 def run_sim(planner: ChunkedPlanner) -> None:
+    """Drive the planner toward a fixed workspace goal and print tick metrics."""
     planner.reset()
     q = [0.0, 0.0, 0.0]
     goal = [0.6, 0.1]
@@ -378,11 +409,13 @@ def run_sim(planner: ChunkedPlanner) -> None:
 
 
 def pixel_to_workspace(px: int, py: int, w: int, h: int) -> List[float]:
+    """Map pixel coordinates from the video frame into the robot workspace."""
     u, v = px / max(w - 1, 1), py / max(h - 1, 1)
     return [WORK_X[0] + u * (WORK_X[1] - WORK_X[0]), WORK_Y[0] + (1.0 - v) * (WORK_Y[1] - WORK_Y[0])]
 
 
 def draw_overlay(frame, goal_px: Optional[Tuple[int, int]], ee: Sequence[float]) -> None:
+    """Annotate the OpenCV frame with the goal marker and end-effector status."""
     import cv2; h, w = frame.shape[:2]
     cv2.circle(frame, (w // 2, h // 2), 18, (0, 255, 255), 1)
     if goal_px is not None:
@@ -391,6 +424,7 @@ def draw_overlay(frame, goal_px: Optional[Tuple[int, int]], ee: Sequence[float])
 
 
 def run_video(planner: ChunkedPlanner, args: argparse.Namespace) -> None:
+    """Main event loop for webcam/video tracking with optional GUI overlays."""
     try:
         import cv2
     except ImportError:
@@ -474,6 +508,7 @@ def run_video(planner: ChunkedPlanner, args: argparse.Namespace) -> None:
 
 
 def on_mouse(event, x, y, flags, state):  # pragma: no cover
+    """Mouse callback that captures a new video-mode goal when the user clicks."""
     import cv2
     if state and event == cv2.EVENT_LBUTTONDOWN:
         state['goal_px'] = (x, y)
@@ -482,6 +517,7 @@ def on_mouse(event, x, y, flags, state):  # pragma: no cover
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Argument parser covering both simulation and video execution modes."""
     parser = argparse.ArgumentParser(description="Chunked planner demo with tinygrad")
     parser.add_argument('--mode', choices=['sim', 'video'], default='sim', help='Run in simulation or video mode')
     parser.add_argument('--video_path', type=str, default=None, help='Video file path for --mode video')
@@ -497,6 +533,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """Entry point that seeds randomness, parses flags, and dispatches modes."""
     random.seed(0)
     try:
         Tensor.manual_seed(0)  # type: ignore[attr-defined]
