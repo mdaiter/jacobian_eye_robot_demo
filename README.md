@@ -5,7 +5,6 @@ This repository contains a compact demonstration of a Jacobian-preconditioned en
 ## What's Inside
 
 - **`eye_robot_demo.py`** – the main script. It layers explanatory docstrings throughout the planner so you can read the source and learn how sampling, Jacobian-based updates, and the tinygrad energy objective fit together.
-- **`eye_robot_demo_tutorial.ipynb`** – a guided notebook that walks through each component with prose, code cells, and mini-experiments. Run it when you want a narrated tour of the planner.
 - **`tests/test_eye_robot_demo.py`** – lightweight pytest checks that confirm the helper utilities and planner loop behave as documented.
 
 ## Why This Repo Is Useful
